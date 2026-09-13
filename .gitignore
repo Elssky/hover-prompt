@@ -1,0 +1,17 @@
+# Gradle and Android build outputs
+.gradle/
+.kotlin/
+build/
+**/build/
+local.properties
+
+# Local IDE files
+.idea/
+*.iml
+
+# Local tooling/runtime files used during development
+.codex-run/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

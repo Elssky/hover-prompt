@@ -5,20 +5,25 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
+import android.content.res.Configuration
+import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import kotlin.math.min
 
 private data class OverlayConfig(
     val text: String,
@@ -29,18 +34,37 @@ private data class OverlayConfig(
     val textColor: Int,
     val backgroundColor: Int,
     val opacity: Float,
-    val loop: Boolean
+    val loop: Boolean,
+    val countdown: Boolean
 )
 
 class OverlayService : Service() {
     private lateinit var windowManager: WindowManager
     private var overlayView: PromptOverlayView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
+    private var configurationCallbacks: ComponentCallbacks? = null
+    private var rotationQuarterTurns = 0
+
+    private data class OverlayFrame(
+        val width: Int,
+        val height: Int,
+        val x: Int,
+        val y: Int
+    )
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+        isRunning = true
+        configurationCallbacks = object : ComponentCallbacks {
+            override fun onConfigurationChanged(newConfig: Configuration) {
+                relayoutForCurrentDisplay()
+            }
+
+            override fun onLowMemory() = Unit
+        }
+        configurationCallbacks?.let(::registerComponentCallbacks)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -63,21 +87,23 @@ class OverlayService : Service() {
             textColor = intent?.getIntExtra(EXTRA_TEXT_COLOR, 0xFFF0EEE5.toInt()) ?: 0xFFF0EEE5.toInt(),
             backgroundColor = intent?.getIntExtra(EXTRA_BACKGROUND_COLOR, 0xFF111821.toInt()) ?: 0xFF111821.toInt(),
             opacity = intent?.getFloatExtra(EXTRA_OPACITY, .92f) ?: .92f,
-            loop = intent?.getBooleanExtra(EXTRA_LOOP, true) ?: true
+            loop = intent?.getBooleanExtra(EXTRA_LOOP, true) ?: true,
+            countdown = intent?.getBooleanExtra(EXTRA_COUNTDOWN, true) ?: true
         )
 
         if (overlayView == null) {
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            val frame = calculateOverlayFrame()
             val params = WindowManager.LayoutParams(
-                dp(340),
-                dp(310),
+                frame.width,
+                frame.height,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 android.graphics.PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = dp(22)
-                y = dp(150)
+                x = frame.x
+                y = frame.y
             }
             layoutParams = params
             overlayView = PromptOverlayView(
@@ -85,7 +111,8 @@ class OverlayService : Service() {
                 config = config,
                 onClose = { stopSelf() },
                 onMove = { dx, dy -> moveOverlay(dx, dy) },
-                onResize = { width, height -> resizeOverlay(width, height) }
+                onResize = { width, height -> resizeOverlay(width, height) },
+                onRotate = { rotateOverlay() }
             )
             windowManager.addView(overlayView, params)
         } else {
@@ -111,17 +138,75 @@ class OverlayService : Service() {
         windowManager.updateViewLayout(view, params)
     }
 
+    private fun rotateOverlay() {
+        rotationQuarterTurns = (rotationQuarterTurns + 1) % 4
+        overlayView?.setRotationQuarterTurns(rotationQuarterTurns)
+        relayoutForCurrentDisplay()
+    }
+
+    private fun relayoutForCurrentDisplay() {
+        val view = overlayView ?: return
+        val params = layoutParams ?: return
+        val frame = calculateOverlayFrame()
+        params.width = frame.width
+        params.height = frame.height
+        params.x = frame.x
+        params.y = frame.y
+        runCatching { windowManager.updateViewLayout(view, params) }
+    }
+
+    private fun calculateOverlayFrame(): OverlayFrame {
+        val (screenWidth, screenHeight) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            metrics.widthPixels to metrics.heightPixels
+        }
+        val displayLandscape = screenWidth > screenHeight
+        val landscape = if (rotationQuarterTurns % 2 == 0) displayLandscape else !displayLandscape
+        val horizontalMargin = dp(24f)
+        val verticalMargin = dp(24f)
+
+        return if (landscape) {
+            val width = min(dp(520f), (screenWidth - horizontalMargin).coerceAtLeast(1))
+            val height = min(dp(250f), (screenHeight - verticalMargin).coerceAtLeast(1))
+            OverlayFrame(
+                width = width,
+                height = height,
+                x = horizontalMargin.coerceAtMost((screenWidth - width).coerceAtLeast(0)),
+                y = ((screenHeight - height) / 2).coerceAtLeast(0)
+            )
+        } else {
+            val width = min(dp(340f), (screenWidth - horizontalMargin).coerceAtLeast(1))
+            val height = min(dp(310f), (screenHeight - verticalMargin).coerceAtLeast(1))
+            OverlayFrame(
+                width = width,
+                height = height,
+                x = dp(22f).coerceAtMost((screenWidth - width).coerceAtLeast(0)),
+                y = dp(150f).coerceAtMost((screenHeight - height).coerceAtLeast(0))
+            )
+        }
+    }
+
     override fun onDestroy() {
+        configurationCallbacks?.let { unregisterComponentCallbacks(it) }
+        configurationCallbacks = null
         overlayView?.let { view ->
             if (::windowManager.isInitialized) windowManager.removeView(view)
         }
         overlayView = null
+        isRunning = false
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun dp(value: Float): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -167,9 +252,14 @@ class OverlayService : Service() {
         const val EXTRA_BACKGROUND_COLOR = "extra_background_color"
         const val EXTRA_OPACITY = "extra_opacity"
         const val EXTRA_LOOP = "extra_loop"
+        const val EXTRA_COUNTDOWN = "extra_countdown"
+        const val ACTION_UPDATE = "com.example.hoverprompt.UPDATE"
         const val ACTION_STOP = "com.example.hoverprompt.STOP"
         private const val CHANNEL_ID = "hover_prompt_running"
         private const val NOTIFICATION_ID = 1001
+
+        @Volatile
+        var isRunning: Boolean = false
     }
 }
 
@@ -178,7 +268,8 @@ private class PromptOverlayView(
     private var config: OverlayConfig,
     private val onClose: () -> Unit,
     private val onMove: (Int, Int) -> Unit,
-    private val onResize: (Int, Int) -> Unit
+    private val onResize: (Int, Int) -> Unit,
+    private val onRotate: () -> Unit
 ) : View(context) {
     private val density = resources.displayMetrics.density
     private val scaledDensity = resources.displayMetrics.scaledDensity
@@ -187,7 +278,17 @@ private class PromptOverlayView(
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.create("sans", Typeface.BOLD) }
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val panelRect = RectF()
+    private val settingsPanelRect = RectF()
+    private val speedTrackRect = RectF()
+    private val fontTrackRect = RectF()
+    private val countdownToggleRect = RectF()
+    private val settingsDoneRect = RectF()
     private var isPlaying = false
+    private var isCountingDown = false
+    private var countdownRemaining = 0
+    private var countdownEndsAt = 0L
+    private var showSettings = false
+    private var rotationQuarterTurns = 0
     private var scrollOffset = 0f
     private var lastFrameTime = 0L
     private var downRawX = 0f
@@ -196,7 +297,16 @@ private class PromptOverlayView(
     private var downY = 0f
     private var dragMode = DragMode.NONE
 
-    private enum class DragMode { NONE, MOVE, RESIZE, CLOSE }
+    private enum class DragMode {
+        NONE,
+        MOVE,
+        RESIZE,
+        CLOSE,
+        SETTINGS_CLOSE,
+        SETTINGS_SPEED,
+        SETTINGS_FONT,
+        SETTINGS_COUNTDOWN
+    }
 
     init {
         setLayerType(View.LAYER_TYPE_SOFTWARE, null)
@@ -205,14 +315,24 @@ private class PromptOverlayView(
     }
 
     fun updateConfig(newConfig: OverlayConfig) {
+        if (config.text != newConfig.text) scrollOffset = 0f
         config = newConfig
+        invalidate()
+    }
+
+    fun setRotationQuarterTurns(value: Int) {
+        rotationQuarterTurns = value % 4
         invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        if (isCountingDown) updateCountdown()
+
+        canvas.save()
+        applyContentTransform(canvas)
         val radius = dp(22f)
-        panelRect.set(0f, 0f, width.toFloat(), height.toFloat())
+        panelRect.set(0f, 0f, contentWidth, contentHeight)
 
         backgroundPaint.color = withAlpha(config.backgroundColor, config.opacity)
         canvas.drawRoundRect(panelRect, radius, radius, backgroundPaint)
@@ -220,6 +340,12 @@ private class PromptOverlayView(
         drawTopBar(canvas)
         drawScript(canvas)
         drawBottomBar(canvas)
+        if (showSettings) {
+            drawSettingsPanel(canvas)
+        } else if (isCountingDown) {
+            drawCountdown(canvas)
+        }
+        canvas.restore()
 
         if (isPlaying) {
             val now = System.nanoTime()
@@ -229,21 +355,51 @@ private class PromptOverlayView(
             }
             lastFrameTime = now
             postInvalidateOnAnimation()
+        } else if (isCountingDown) {
+            lastFrameTime = 0L
+            postInvalidateOnAnimation()
         } else {
             lastFrameTime = 0L
         }
     }
 
+    private fun applyContentTransform(canvas: Canvas) {
+        when (rotationQuarterTurns) {
+            1 -> {
+                canvas.translate(width / 2f, height / 2f)
+                canvas.rotate(90f)
+                canvas.translate(-contentWidth / 2f, -contentHeight / 2f)
+            }
+            2 -> canvas.rotate(180f, width / 2f, height / 2f)
+            3 -> {
+                canvas.translate(width / 2f, height / 2f)
+                canvas.rotate(-90f)
+                canvas.translate(-contentWidth / 2f, -contentHeight / 2f)
+            }
+        }
+    }
+
+    private fun updateCountdown() {
+        val remaining = ((countdownEndsAt - System.nanoTime() + 999_999_999L) / 1_000_000_000L).toInt()
+        if (remaining <= 0) {
+            isCountingDown = false
+            isPlaying = true
+            lastFrameTime = 0L
+        } else {
+            countdownRemaining = remaining
+        }
+    }
+
     private fun drawTopBar(canvas: Canvas) {
-        // Six-dot handle: the most important affordance when the overlay sits over another app.
         val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFB4BEC0.toInt() }
-        val startX = width / 2f - dp(13f)
+        val startX = contentWidth / 2f - dp(13f)
         for (row in 0..1) {
             for (column in 0..2) {
                 canvas.drawCircle(startX + column * dp(13f), dp(14f) + row * dp(8f), dp(1.7f), dotPaint)
             }
         }
 
+        labelPaint.typeface = Typeface.create("sans", Typeface.BOLD)
         labelPaint.color = 0xFFE9E8E1.toInt()
         labelPaint.textSize = sp(12f)
         canvas.drawText("直播台词", dp(16f), dp(53f), labelPaint)
@@ -252,33 +408,42 @@ private class PromptOverlayView(
         labelPaint.textSize = sp(9f)
         canvas.drawRoundRect(RectF(dp(86f), dp(40f), dp(142f), dp(59f)), dp(9f), dp(9f), labelPaint)
         labelPaint.color = 0xFF0B1014.toInt()
-        canvas.drawText(if (isPlaying) "正在读" else config.mode.label, dp(91f), dp(53f), labelPaint)
+        canvas.drawText(
+            when {
+                isCountingDown -> "准备中"
+                isPlaying -> "正在读"
+                else -> config.mode.label
+            },
+            dp(91f),
+            dp(53f),
+            labelPaint
+        )
 
         labelPaint.color = 0xFFD7DEDE.toInt()
         labelPaint.textSize = sp(23f)
-        canvas.drawText("×", width - dp(28f), dp(27f), labelPaint)
+        canvas.drawText("×", contentWidth - dp(28f), dp(27f), labelPaint)
         linePaint.color = 0x334E5C5E
         linePaint.strokeWidth = dp(1f)
-        canvas.drawLine(dp(14f), dp(68f), width - dp(14f), dp(68f), linePaint)
+        canvas.drawLine(dp(14f), dp(68f), contentWidth - dp(14f), dp(68f), linePaint)
     }
 
     private fun drawScript(canvas: Canvas) {
         val top = dp(82f)
-        val bottom = height - dp(69f)
+        val bottom = contentHeight - dp(69f)
         canvas.save()
-        canvas.clipRect(dp(14f), top, width - dp(14f), bottom)
+        canvas.clipRect(dp(14f), top, contentWidth - dp(14f), bottom)
 
         linePaint.color = 0xD6C4F76A.toInt()
         linePaint.strokeWidth = dp(1f)
         val guideY = top + (bottom - top) * .52f
-        canvas.drawLine(dp(10f), guideY, width - dp(10f), guideY, linePaint)
+        canvas.drawLine(dp(10f), guideY, contentWidth - dp(10f), guideY, linePaint)
         canvas.drawCircle(dp(10f), guideY, dp(3f), linePaint)
 
         textPaint.color = config.textColor
         textPaint.textSize = sp(config.fontSize)
         textPaint.typeface = Typeface.create("sans", Typeface.NORMAL)
         val lineHeight = textPaint.textSize * config.lineSpacing
-        val lines = wrapLines(config.text.replace("\r", "").split("\n"), width - dp(28f))
+        val lines = wrapLines(config.text.replace("\r", "").split("\n"), contentWidth - dp(28f))
         val startY = guideY - lineHeight * .55f - scrollOffset
         lines.forEachIndexed { index, line ->
             val y = startY + index * lineHeight
@@ -286,10 +451,10 @@ private class PromptOverlayView(
                 canvas.drawText(line, dp(14f), y, textPaint)
             }
         }
-        if (!isPlaying) {
+        if (!isPlaying && !isCountingDown) {
             val pillWidth = dp(132f)
             val pillHeight = dp(42f)
-            val pillLeft = width / 2f - pillWidth / 2f
+            val pillLeft = contentWidth / 2f - pillWidth / 2f
             val pillTop = guideY - pillHeight / 2f
             backgroundPaint.color = 0xFFC4F76A.toInt()
             canvas.drawRoundRect(
@@ -312,6 +477,23 @@ private class PromptOverlayView(
                 isPlaying = false
             }
         }
+    }
+
+    private fun drawCountdown(canvas: Canvas) {
+        val boxWidth = min(dp(180f), contentWidth - dp(32f))
+        val boxHeight = dp(104f)
+        val left = contentWidth / 2f - boxWidth / 2f
+        val top = contentHeight / 2f - boxHeight / 2f
+        backgroundPaint.color = withAlpha(config.backgroundColor, .96f)
+        canvas.drawRoundRect(RectF(left, top, left + boxWidth, top + boxHeight), dp(22f), dp(22f), backgroundPaint)
+
+        labelPaint.typeface = Typeface.create("sans", Typeface.BOLD)
+        labelPaint.color = 0xFFC4F76A.toInt()
+        labelPaint.textSize = sp(34f)
+        drawCenteredText(canvas, countdownRemaining.toString(), contentWidth / 2f, top + dp(54f), labelPaint)
+        labelPaint.color = 0xFFE9E8E1.toInt()
+        labelPaint.textSize = sp(11f)
+        drawCenteredText(canvas, "即将开始", contentWidth / 2f, top + dp(82f), labelPaint)
     }
 
     private fun wrapLines(sourceLines: List<String>, maxWidth: Float): List<String> {
@@ -338,18 +520,170 @@ private class PromptOverlayView(
 
     private fun drawBottomBar(canvas: Canvas) {
         linePaint.color = 0x334E5C5E
-        canvas.drawLine(dp(14f), height - dp(57f), width - dp(14f), height - dp(57f), linePaint)
+        canvas.drawLine(dp(14f), contentHeight - dp(57f), contentWidth - dp(14f), contentHeight - dp(57f), linePaint)
 
+        val left = dp(14f)
+        val right = contentWidth - dp(64f)
+        val icons = listOf(
+            "↶",
+            "☷",
+            if (isPlaying) "Ⅱ" else "▶",
+            if (rotationQuarterTurns % 2 == 0) "↻" else "↺",
+            "∞"
+        )
+        val cellWidth = (right - left) / icons.size
+        val centers = icons.indices.map { index -> left + cellWidth * (index + .5f) }
+        labelPaint.typeface = Typeface.create("sans", Typeface.NORMAL)
         labelPaint.color = 0xFFC7D0D0.toInt()
         labelPaint.textSize = sp(19f)
-        canvas.drawText("↶", dp(28f), height - dp(24f), labelPaint)
-        canvas.drawText("☷", dp(91f), height - dp(24f), labelPaint)
-        canvas.drawText("↻", dp(154f), height - dp(24f), labelPaint)
-        canvas.drawText("▤", dp(218f), height - dp(24f), labelPaint)
+        icons.forEachIndexed { index, icon ->
+            drawCenteredText(canvas, icon, centers[index], contentHeight - dp(24f), labelPaint)
+        }
 
         labelPaint.color = 0xFFC4F76A.toInt()
         labelPaint.textSize = sp(24f)
-        canvas.drawText("⌟", width - dp(34f), height - dp(22f), labelPaint)
+        drawCenteredText(canvas, "⌟", contentWidth - dp(34f), contentHeight - dp(22f), labelPaint)
+    }
+
+    private fun drawSettingsPanel(canvas: Canvas) {
+        val panel = settingsPanel()
+        val speedTrack = settingsSpeedTrack(panel)
+        val fontTrack = settingsFontTrack(panel)
+        val countdownToggle = settingsCountdownToggle(panel)
+        settingsDoneRect.set(panel.left + dp(24f), panel.bottom - dp(40f), panel.right - dp(24f), panel.bottom - dp(12f))
+
+        backgroundPaint.color = withAlpha(config.backgroundColor, .98f)
+        canvas.drawRoundRect(panel, dp(22f), dp(22f), backgroundPaint)
+
+        labelPaint.typeface = Typeface.create("sans", Typeface.BOLD)
+        labelPaint.color = 0xFFE9E8E1.toInt()
+        labelPaint.textSize = sp(16f)
+        canvas.drawText("提词设置", panel.left + dp(22f), panel.top + dp(38f), labelPaint)
+
+        labelPaint.color = 0xFFD7DEDE.toInt()
+        labelPaint.textSize = sp(22f)
+        canvas.drawText("×", panel.right - dp(30f), panel.top + dp(32f), labelPaint)
+
+        drawSettingSlider(canvas, "速度", "${config.speed.toInt()} dp/s", speedTrack, config.speed, 8f..60f)
+        drawSettingSlider(canvas, "字号", "${config.fontSize.toInt()} sp", fontTrack, config.fontSize, 16f..36f)
+
+        labelPaint.typeface = Typeface.create("sans", Typeface.NORMAL)
+        labelPaint.color = 0xFFE9E8E1.toInt()
+        labelPaint.textSize = sp(11f)
+        canvas.drawText("播放前倒计时", panel.left + dp(24f), countdownToggle.top + dp(16f), labelPaint)
+        backgroundPaint.color = if (config.countdown) 0xFFC4F76A.toInt() else 0xFF354047.toInt()
+        canvas.drawRoundRect(countdownToggle, dp(10f), dp(10f), backgroundPaint)
+        labelPaint.color = if (config.countdown) 0xFF0B1014.toInt() else 0xFFD7DEDE.toInt()
+        labelPaint.textSize = sp(9f)
+        drawCenteredText(canvas, if (config.countdown) "3 秒" else "关闭", countdownToggle.centerX(), countdownToggle.centerY() + dp(3f), labelPaint)
+
+        backgroundPaint.color = 0xFFC4F76A.toInt()
+        canvas.drawRoundRect(settingsDoneRect, dp(14f), dp(14f), backgroundPaint)
+        labelPaint.color = 0xFF0B1014.toInt()
+        labelPaint.textSize = sp(11f)
+        drawCenteredText(canvas, "完成", settingsDoneRect.centerX(), settingsDoneRect.centerY() + dp(4f), labelPaint)
+    }
+
+    private fun drawSettingSlider(
+        canvas: Canvas,
+        label: String,
+        value: String,
+        track: RectF,
+        current: Float,
+        range: ClosedFloatingPointRange<Float>
+    ) {
+        labelPaint.typeface = Typeface.create("sans", Typeface.NORMAL)
+        labelPaint.color = 0xFFE9E8E1.toInt()
+        labelPaint.textSize = sp(12f)
+        canvas.drawText(label, track.left, track.top - dp(13f), labelPaint)
+        labelPaint.color = 0xFFC4F76A.toInt()
+        labelPaint.textSize = sp(11f)
+        canvas.drawText(value, track.right - labelPaint.measureText(value), track.top - dp(13f), labelPaint)
+
+        backgroundPaint.color = 0xFF354047.toInt()
+        canvas.drawRoundRect(track, dp(5f), dp(5f), backgroundPaint)
+        val fraction = ((current - range.start) / (range.endInclusive - range.start)).coerceIn(0f, 1f)
+        val activeRight = track.left + track.width() * fraction
+        backgroundPaint.color = 0xFFC4F76A.toInt()
+        canvas.drawRoundRect(RectF(track.left, track.top, activeRight, track.bottom), dp(5f), dp(5f), backgroundPaint)
+        canvas.drawCircle(activeRight, track.centerY(), dp(7f), backgroundPaint)
+    }
+
+    private fun settingsPanel(): RectF {
+        val panelHeight = min(dp(264f), (contentHeight - dp(24f)).coerceAtLeast(dp(1f)))
+        val top = (contentHeight - panelHeight) / 2f
+        settingsPanelRect.set(dp(12f), top, contentWidth - dp(12f), top + panelHeight)
+        return settingsPanelRect
+    }
+
+    private fun settingsSpeedTrack(panel: RectF): RectF {
+        speedTrackRect.set(panel.left + dp(24f), panel.top + dp(94f), panel.right - dp(24f), panel.top + dp(106f))
+        return speedTrackRect
+    }
+
+    private fun settingsFontTrack(panel: RectF): RectF {
+        fontTrackRect.set(panel.left + dp(24f), panel.top + dp(158f), panel.right - dp(24f), panel.top + dp(170f))
+        return fontTrackRect
+    }
+
+    private fun settingsCountdownToggle(panel: RectF): RectF {
+        countdownToggleRect.set(panel.right - dp(94f), panel.top + dp(190f), panel.right - dp(24f), panel.top + dp(214f))
+        return countdownToggleRect
+    }
+
+    private fun updateSpeedFromX(x: Float) {
+        val track = settingsSpeedTrack(settingsPanel())
+        val fraction = ((x - track.left) / track.width()).coerceIn(0f, 1f)
+        config = config.copy(speed = 8f + fraction * (60f - 8f))
+        invalidate()
+    }
+
+    private fun updateFontFromX(x: Float) {
+        val track = settingsFontTrack(settingsPanel())
+        val fraction = ((x - track.left) / track.width()).coerceIn(0f, 1f)
+        config = config.copy(fontSize = 16f + fraction * (36f - 16f))
+        invalidate()
+    }
+
+    private fun handleBottomAction(x: Float) {
+        val left = dp(14f)
+        val right = contentWidth - dp(64f)
+        if (x !in left..right) return
+        val index = (((x - left) / ((right - left) / 5f)).toInt()).coerceIn(0, 4)
+        when (index) {
+            0 -> scrollOffset = 0f
+            1 -> {
+                isPlaying = false
+                isCountingDown = false
+                showSettings = true
+            }
+            2 -> togglePlayback()
+            3 -> onRotate()
+            4 -> config = config.copy(loop = !config.loop)
+        }
+        invalidate()
+    }
+
+    private fun togglePlayback() {
+        if (isPlaying) {
+            isPlaying = false
+            return
+        }
+        if (isCountingDown) {
+            isCountingDown = false
+            return
+        }
+        if (config.countdown) {
+            countdownRemaining = 3
+            countdownEndsAt = System.nanoTime() + 3_000_000_000L
+            isCountingDown = true
+        } else {
+            isPlaying = true
+        }
+    }
+
+    private fun drawCenteredText(canvas: Canvas, text: String, centerX: Float, baseline: Float, paint: Paint) {
+        canvas.drawText(text, centerX - paint.measureText(text) / 2f, baseline, paint)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -357,17 +691,52 @@ private class PromptOverlayView(
             MotionEvent.ACTION_DOWN -> {
                 downRawX = event.rawX
                 downRawY = event.rawY
-                downX = event.x
-                downY = event.y
+                val point = contentPoint(event.x, event.y)
+                downX = point.x
+                downY = point.y
+
+                if (showSettings) {
+                    val panel = settingsPanel()
+                    val speedTrack = settingsSpeedTrack(panel)
+                    val fontTrack = settingsFontTrack(panel)
+                    val countdownToggle = settingsCountdownToggle(panel)
+                    settingsDoneRect.set(panel.left + dp(24f), panel.bottom - dp(40f), panel.right - dp(24f), panel.bottom - dp(12f))
+                    dragMode = when {
+                        point.x > panel.right - dp(62f) && point.y < panel.top + dp(58f) -> DragMode.SETTINGS_CLOSE
+                        settingsDoneRect.contains(point.x, point.y) -> DragMode.SETTINGS_CLOSE
+                        speedTrack.contains(point.x, point.y) -> DragMode.SETTINGS_SPEED
+                        fontTrack.contains(point.x, point.y) -> DragMode.SETTINGS_FONT
+                        countdownToggle.contains(point.x, point.y) -> DragMode.SETTINGS_COUNTDOWN
+                        else -> DragMode.NONE
+                    }
+                    when (dragMode) {
+                        DragMode.SETTINGS_SPEED -> updateSpeedFromX(point.x)
+                        DragMode.SETTINGS_FONT -> updateFontFromX(point.x)
+                        DragMode.SETTINGS_COUNTDOWN -> config = config.copy(countdown = !config.countdown)
+                        else -> Unit
+                    }
+                    return true
+                }
+
                 dragMode = when {
-                    event.y < dp(38f) && event.x > width - dp(55f) -> DragMode.CLOSE
-                    event.y < dp(36f) -> DragMode.MOVE
-                    event.x > width - dp(58f) && event.y > height - dp(64f) -> DragMode.RESIZE
+                    point.y < dp(64f) && point.x > contentWidth - dp(70f) -> DragMode.CLOSE
+                    point.y < dp(36f) -> DragMode.MOVE
+                    point.x > contentWidth - dp(64f) && point.y > contentHeight - dp(70f) -> DragMode.RESIZE
                     else -> DragMode.NONE
                 }
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (showSettings) {
+                    val point = contentPoint(event.x, event.y)
+                    when (dragMode) {
+                        DragMode.SETTINGS_SPEED -> updateSpeedFromX(point.x)
+                        DragMode.SETTINGS_FONT -> updateFontFromX(point.x)
+                        else -> Unit
+                    }
+                    return true
+                }
+
                 val dx = (event.rawX - downRawX).toInt()
                 val dy = (event.rawY - downRawY).toInt()
                 when (dragMode) {
@@ -377,32 +746,38 @@ private class PromptOverlayView(
                         onMove(dx, dy)
                     }
                     DragMode.RESIZE -> {
-                        val newWidth = (width + dx).coerceIn(dp(250f), dp(480f))
-                        val newHeight = (height + dy).coerceIn(dp(220f), dp(560f))
+                        val newWidth = (width + dx).coerceIn(dp(250f).toInt(), dp(720f).toInt())
+                        val newHeight = (height + dy).coerceIn(dp(180f).toInt(), dp(560f).toInt())
                         downRawX = event.rawX
                         downRawY = event.rawY
                         onResize(newWidth, newHeight)
                     }
-                    DragMode.CLOSE -> Unit
+                    DragMode.CLOSE,
+                    DragMode.SETTINGS_CLOSE,
+                    DragMode.SETTINGS_SPEED,
+                    DragMode.SETTINGS_FONT,
+                    DragMode.SETTINGS_COUNTDOWN,
                     DragMode.NONE -> Unit
                 }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (showSettings) {
+                    if (event.actionMasked == MotionEvent.ACTION_UP && dragMode == DragMode.SETTINGS_CLOSE) {
+                        showSettings = false
+                    }
+                    dragMode = DragMode.NONE
+                    invalidate()
+                    return true
+                }
+
                 if (event.actionMasked == MotionEvent.ACTION_UP && dragMode == DragMode.CLOSE) {
                     onClose()
                 } else if (dragMode == DragMode.NONE && event.actionMasked == MotionEvent.ACTION_UP) {
                     when {
-                        downY > height - dp(60f) && downX in dp(65f)..dp(135f) -> {
-                            scrollOffset = 0f
-                            invalidate()
-                        }
-                        downY > height - dp(60f) && downX in dp(135f)..dp(205f) -> {
-                            isPlaying = !isPlaying
-                            invalidate()
-                        }
-                        downY in dp(78f)..(height - dp(70f)) -> {
-                            isPlaying = !isPlaying
+                        downY > contentHeight - dp(64f) -> handleBottomAction(downX)
+                        downY in dp(78f)..(contentHeight - dp(70f)) -> {
+                            togglePlayback()
                             invalidate()
                         }
                     }
@@ -412,6 +787,19 @@ private class PromptOverlayView(
             }
         }
         return true
+    }
+
+    private val contentWidth: Float
+        get() = if (rotationQuarterTurns % 2 == 0) width.toFloat() else height.toFloat()
+
+    private val contentHeight: Float
+        get() = if (rotationQuarterTurns % 2 == 0) height.toFloat() else width.toFloat()
+
+    private fun contentPoint(x: Float, y: Float): PointF = when (rotationQuarterTurns) {
+        1 -> PointF(y, contentHeight - x)
+        2 -> PointF(contentWidth - x, contentHeight - y)
+        3 -> PointF(contentWidth - y, x)
+        else -> PointF(x, y)
     }
 
     private fun dp(value: Float): Float = value * density

@@ -1,7 +1,12 @@
 package com.example.hoverprompt
 
+import android.Manifest
+import android.content.ClipData
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
@@ -21,6 +26,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -57,6 +63,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,12 +76,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 
 private val Ink = Color(0xFF090D12)
 private val Panel = Color(0xFF111821)
@@ -117,6 +126,7 @@ class MainActivity : ComponentActivity() {
             HoverPromptTheme {
                 PromptHome(
                     onLaunchOverlay = { script, settings -> launchOverlay(script, settings) },
+                    onSettingsChange = { script, settings -> syncOverlay(script, settings) },
                     onRequestPermission = { requestOverlayPermission() }
                 )
             }
@@ -139,7 +149,20 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val intent = Intent(this, OverlayService::class.java).apply {
+        requestNotificationPermissionIfNeeded()
+        startForegroundService(createOverlayIntent(script, settings))
+        Toast.makeText(this, "悬浮提词已打开，可切换到相机或抖音", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun syncOverlay(script: String, settings: PromptSettings) {
+        if (!OverlayService.isRunning) return
+        startForegroundService(createOverlayIntent(script, settings).apply {
+            action = OverlayService.ACTION_UPDATE
+        })
+    }
+
+    private fun createOverlayIntent(script: String, settings: PromptSettings): Intent =
+        Intent(this, OverlayService::class.java).apply {
             putExtra(OverlayService.EXTRA_TEXT, script)
             putExtra(OverlayService.EXTRA_MODE, settings.mode.name)
             putExtra(OverlayService.EXTRA_SPEED, settings.speed)
@@ -149,9 +172,19 @@ class MainActivity : ComponentActivity() {
             putExtra(OverlayService.EXTRA_BACKGROUND_COLOR, settings.backgroundColor.toArgb())
             putExtra(OverlayService.EXTRA_OPACITY, settings.opacity)
             putExtra(OverlayService.EXTRA_LOOP, settings.loop)
+            putExtra(OverlayService.EXTRA_COUNTDOWN, settings.countdown)
         }
-        startForegroundService(intent)
-        Toast.makeText(this, "悬浮提词已打开，可切换到相机或抖音", Toast.LENGTH_SHORT).show()
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+        }
+    }
+
+    companion object {
+        private const val REQUEST_NOTIFICATIONS = 100
     }
 }
 
@@ -178,6 +211,7 @@ private fun HoverPromptTheme(content: @Composable () -> Unit) {
 @Composable
 private fun PromptHome(
     onLaunchOverlay: (String, PromptSettings) -> Unit,
+    onSettingsChange: (String, PromptSettings) -> Unit,
     onRequestPermission: () -> Unit
 ) {
     var script by remember { mutableStateOf(TextFieldValue(SAMPLE_SCRIPT)) }
@@ -236,13 +270,22 @@ private fun PromptHome(
             }
             ScriptEditor(
                 value = script,
-                onValueChange = { script = it },
-                onClear = { script = TextFieldValue("") }
+                onValueChange = {
+                    script = it
+                    onSettingsChange(it.text, settings)
+                },
+                onClear = {
+                    script = TextFieldValue("")
+                    onSettingsChange("", settings)
+                }
             )
             AnimatedVisibility(visible = showSettings) {
                 PromptSettingsPanel(
                     settings = settings,
-                    onSettingsChange = { settings = it }
+                    onSettingsChange = {
+                        settings = it
+                        onSettingsChange(script.text, it)
+                    }
                 )
             }
             TipCard()
@@ -306,6 +349,15 @@ private fun PreviewStage(
     onTogglePlaying: () -> Unit
 ) {
     val playScale by animateFloatAsState(if (isPlaying) 1.04f else 1f, label = "play-scale")
+    var previewOffset by remember(script) { mutableStateOf(0f) }
+
+    LaunchedEffect(isPlaying, settings.speed, script) {
+        while (isPlaying) {
+            delay(16L)
+            previewOffset = (previewOffset + settings.speed * 0.016f) % 180f
+        }
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth().height(252.dp),
         shape = RoundedCornerShape(26.dp),
@@ -343,7 +395,10 @@ private fun PreviewStage(
                         Text("${settings.mode.label}  ·  ${settings.speed.toInt()} dp/s", color = Muted, fontSize = 10.sp)
                     }
                     Spacer(Modifier.height(10.dp))
-                    Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    Box(
+                        modifier = Modifier.weight(1f).fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                    ) {
                         Box(
                             modifier = Modifier.fillMaxWidth().padding(top = 56.dp)
                                 .height(1.dp).background(Mint.copy(alpha = .75f))
@@ -356,6 +411,7 @@ private fun PreviewStage(
                             maxLines = 4,
                             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                             modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
+                                .offset(y = (-previewOffset).dp)
                         )
                     }
                     Row(
@@ -403,6 +459,8 @@ private fun ScriptEditor(
     onValueChange: (TextFieldValue) -> Unit,
     onClear: () -> Unit
 ) {
+    val context = LocalContext.current
+
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -414,7 +472,11 @@ private fun ScriptEditor(
                 Text("录制前先把节奏写下来", color = Muted, fontSize = 12.sp)
             }
             Row {
-                IconButton(onClick = { }) {
+                IconButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("台词", value.text))
+                    Toast.makeText(context, "台词已复制", Toast.LENGTH_SHORT).show()
+                }) {
                     Icon(Icons.Filled.ContentCopy, contentDescription = "复制台词", tint = Muted, modifier = Modifier.size(19.dp))
                 }
                 IconButton(onClick = onClear) {
@@ -476,7 +538,7 @@ private fun PromptSettingsPanel(
             ModeSelector(settings.mode) { onSettingsChange(settings.copy(mode = it)) }
             SliderSetting(
                 label = "滚动速度",
-                valueText = "${settings.speed.toInt()} px/s",
+                valueText = "${settings.speed.toInt()} dp/s",
                 value = settings.speed,
                 range = 8f..60f,
                 onValueChange = { onSettingsChange(settings.copy(speed = it)) }
