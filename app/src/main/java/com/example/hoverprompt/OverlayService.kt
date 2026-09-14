@@ -21,8 +21,12 @@ import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.core.app.NotificationCompat
+import kotlin.math.abs
 import kotlin.math.min
 
 private data class OverlayConfig(
@@ -44,6 +48,9 @@ class OverlayService : Service() {
     private var layoutParams: WindowManager.LayoutParams? = null
     private var configurationCallbacks: ComponentCallbacks? = null
     private var rotationQuarterTurns = 0
+    private var expandedFrame: OverlayFrame? = null
+    private var resizeStartX = 0
+    private var resizeStartY = 0
 
     private data class OverlayFrame(
         val width: Int,
@@ -78,22 +85,29 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
+        val savedSettings = PromptSettingsStore.load(this)
         val config = OverlayConfig(
             text = intent?.getStringExtra(EXTRA_TEXT).orEmpty().ifBlank { "输入一段台词，开始你的表达。" },
-            mode = runCatching { PromptMode.valueOf(intent?.getStringExtra(EXTRA_MODE).orEmpty()) }.getOrDefault(PromptMode.PACE),
-            speed = intent?.getFloatExtra(EXTRA_SPEED, 24f) ?: 24f,
-            fontSize = intent?.getFloatExtra(EXTRA_FONT_SIZE, 23f) ?: 23f,
-            lineSpacing = intent?.getFloatExtra(EXTRA_LINE_SPACING, 1.28f) ?: 1.28f,
-            textColor = intent?.getIntExtra(EXTRA_TEXT_COLOR, 0xFFF0EEE5.toInt()) ?: 0xFFF0EEE5.toInt(),
-            backgroundColor = intent?.getIntExtra(EXTRA_BACKGROUND_COLOR, 0xFF111821.toInt()) ?: 0xFF111821.toInt(),
-            opacity = intent?.getFloatExtra(EXTRA_OPACITY, .92f) ?: .92f,
-            loop = intent?.getBooleanExtra(EXTRA_LOOP, true) ?: true,
-            countdown = intent?.getBooleanExtra(EXTRA_COUNTDOWN, true) ?: true
+            mode = runCatching {
+                intent?.getStringExtra(EXTRA_MODE)?.let(PromptMode::valueOf) ?: savedSettings.mode
+            }.getOrDefault(savedSettings.mode),
+            speed = intent?.getFloatExtra(EXTRA_SPEED, savedSettings.speed) ?: savedSettings.speed,
+            fontSize = intent?.getFloatExtra(EXTRA_FONT_SIZE, savedSettings.fontSize) ?: savedSettings.fontSize,
+            lineSpacing = intent?.getFloatExtra(EXTRA_LINE_SPACING, savedSettings.lineSpacing) ?: savedSettings.lineSpacing,
+            textColor = intent?.getIntExtra(EXTRA_TEXT_COLOR, savedSettings.textColor.toArgb())
+                ?: savedSettings.textColor.toArgb(),
+            backgroundColor = intent?.getIntExtra(EXTRA_BACKGROUND_COLOR, savedSettings.backgroundColor.toArgb())
+                ?: savedSettings.backgroundColor.toArgb(),
+            opacity = intent?.getFloatExtra(EXTRA_OPACITY, savedSettings.opacity) ?: savedSettings.opacity,
+            loop = intent?.getBooleanExtra(EXTRA_LOOP, savedSettings.loop) ?: savedSettings.loop,
+            countdown = intent?.getBooleanExtra(EXTRA_COUNTDOWN, savedSettings.countdown) ?: savedSettings.countdown
         )
+        persistConfig(config)
 
         if (overlayView == null) {
             windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
             val frame = calculateOverlayFrame()
+            expandedFrame = frame
             val params = WindowManager.LayoutParams(
                 frame.width,
                 frame.height,
@@ -109,10 +123,13 @@ class OverlayService : Service() {
             overlayView = PromptOverlayView(
                 context = this,
                 config = config,
-                onClose = { stopSelf() },
+                onCollapse = { collapseOverlay() },
                 onMove = { dx, dy -> moveOverlay(dx, dy) },
-                onResize = { width, height -> resizeOverlay(width, height) },
-                onRotate = { rotateOverlay() }
+                onResizeStart = { beginResize() },
+                onResize = { width, height, dx, dy -> resizeOverlay(width, height, dx, dy) },
+                onRotate = { rotateOverlay() },
+                onExpand = { expandOverlay() },
+                onConfigChanged = { persistConfig(it) }
             )
             windowManager.addView(overlayView, params)
         } else {
@@ -127,15 +144,50 @@ class OverlayService : Service() {
         val params = layoutParams ?: return
         params.x += dx
         params.y += dy
+        clampWindowPosition(params)
         windowManager.updateViewLayout(view, params)
+        expandedFrame = OverlayFrame(params.width, params.height, params.x, params.y)
     }
 
-    private fun resizeOverlay(width: Int, height: Int) {
+    private fun beginResize() {
+        val params = layoutParams ?: return
+        resizeStartX = params.x
+        resizeStartY = params.y
+    }
+
+    private fun resizeOverlay(width: Int, height: Int, dx: Int, dy: Int) {
         val view = overlayView ?: return
         val params = layoutParams ?: return
         params.width = width
         params.height = height
+        params.x = resizeStartX + dx
+        params.y = resizeStartY + dy
+        clampWindowPosition(params)
         windowManager.updateViewLayout(view, params)
+        expandedFrame = OverlayFrame(params.width, params.height, params.x, params.y)
+    }
+
+    private fun clampWindowPosition(params: WindowManager.LayoutParams) {
+        val (screenWidth, screenHeight) = currentDisplaySize()
+        params.x = params.x.coerceIn(0, (screenWidth - params.width).coerceAtLeast(0))
+        params.y = params.y.coerceIn(0, (screenHeight - params.height).coerceAtLeast(0))
+    }
+
+    private fun persistConfig(config: OverlayConfig) {
+        PromptSettingsStore.save(
+            this,
+            PromptSettings(
+                mode = config.mode,
+                speed = config.speed,
+                fontSize = config.fontSize,
+                lineSpacing = config.lineSpacing,
+                textColor = Color(config.textColor),
+                backgroundColor = Color(config.backgroundColor),
+                opacity = config.opacity,
+                loop = config.loop,
+                countdown = config.countdown
+            )
+        )
     }
 
     private fun rotateOverlay() {
@@ -144,27 +196,49 @@ class OverlayService : Service() {
         relayoutForCurrentDisplay()
     }
 
-    private fun relayoutForCurrentDisplay() {
+    private fun collapseOverlay() {
         val view = overlayView ?: return
         val params = layoutParams ?: return
-        val frame = calculateOverlayFrame()
+        if (view.isCollapsed) return
+
+        expandedFrame = OverlayFrame(params.width, params.height, params.x, params.y)
+        val bubble = calculateCollapsedFrame()
+        params.width = bubble.width
+        params.height = bubble.height
+        params.x = bubble.x
+        params.y = bubble.y
+        view.setCollapsed(true)
+        runCatching { windowManager.updateViewLayout(view, params) }
+    }
+
+    private fun expandOverlay() {
+        val view = overlayView ?: return
+        val params = layoutParams ?: return
+        if (!view.isCollapsed) return
+
+        val frame = expandedFrame ?: calculateOverlayFrame()
         params.width = frame.width
         params.height = frame.height
         params.x = frame.x
         params.y = frame.y
+        view.setCollapsed(false)
+        runCatching { windowManager.updateViewLayout(view, params) }
+    }
+
+    private fun relayoutForCurrentDisplay() {
+        val view = overlayView ?: return
+        val params = layoutParams ?: return
+        val frame = if (view.isCollapsed) calculateCollapsedFrame() else calculateOverlayFrame()
+        params.width = frame.width
+        params.height = frame.height
+        params.x = frame.x
+        params.y = frame.y
+        if (!view.isCollapsed) expandedFrame = frame
         runCatching { windowManager.updateViewLayout(view, params) }
     }
 
     private fun calculateOverlayFrame(): OverlayFrame {
-        val (screenWidth, screenHeight) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = windowManager.currentWindowMetrics.bounds
-            bounds.width() to bounds.height()
-        } else {
-            val metrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(metrics)
-            metrics.widthPixels to metrics.heightPixels
-        }
+        val (screenWidth, screenHeight) = currentDisplaySize()
         val displayLandscape = screenWidth > screenHeight
         val landscape = if (rotationQuarterTurns % 2 == 0) displayLandscape else !displayLandscape
         val horizontalMargin = dp(24f)
@@ -190,6 +264,27 @@ class OverlayService : Service() {
             )
         }
     }
+
+    private fun calculateCollapsedFrame(): OverlayFrame {
+        val (screenWidth, screenHeight) = currentDisplaySize()
+        val size = dp(58f).coerceAtMost(min(screenWidth, screenHeight).coerceAtLeast(1))
+        return OverlayFrame(
+            width = size,
+            height = size,
+            x = (screenWidth - size).coerceAtLeast(0),
+            y = ((screenHeight - size) / 2).coerceAtLeast(0)
+        )
+    }
+
+    private fun currentDisplaySize(): Pair<Int, Int> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            bounds.width() to bounds.height()
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            metrics.widthPixels to metrics.heightPixels
+        }
 
     override fun onDestroy() {
         configurationCallbacks?.let { unregisterComponentCallbacks(it) }
@@ -266,13 +361,17 @@ class OverlayService : Service() {
 private class PromptOverlayView(
     context: Context,
     private var config: OverlayConfig,
-    private val onClose: () -> Unit,
+    private val onCollapse: () -> Unit,
     private val onMove: (Int, Int) -> Unit,
-    private val onResize: (Int, Int) -> Unit,
-    private val onRotate: () -> Unit
+    private val onResizeStart: () -> Unit,
+    private val onResize: (Int, Int, Int, Int) -> Unit,
+    private val onRotate: () -> Unit,
+    private val onExpand: () -> Unit,
+    private val onConfigChanged: (OverlayConfig) -> Unit
 ) : View(context) {
     private val density = resources.displayMetrics.density
     private val scaledDensity = resources.displayMetrics.scaledDensity
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.create("sans", Typeface.NORMAL) }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.create("sans", Typeface.BOLD) }
@@ -288,6 +387,8 @@ private class PromptOverlayView(
     private var countdownRemaining = 0
     private var countdownEndsAt = 0L
     private var showSettings = false
+    var isCollapsed: Boolean = false
+        private set
     private var rotationQuarterTurns = 0
     private var scrollOffset = 0f
     private var lastFrameTime = 0L
@@ -295,17 +396,25 @@ private class PromptOverlayView(
     private var downRawY = 0f
     private var downX = 0f
     private var downY = 0f
+    private var downWidth = 0
+    private var downHeight = 0
+    private var scrollAtTouchStart = 0f
+    private var didDragScript = false
     private var dragMode = DragMode.NONE
 
     private enum class DragMode {
         NONE,
         MOVE,
-        RESIZE,
+        RESIZE_LEFT,
+        RESIZE_RIGHT,
+        RESIZE_TOP,
+        RESIZE_BOTTOM,
         CLOSE,
         SETTINGS_CLOSE,
         SETTINGS_SPEED,
         SETTINGS_FONT,
-        SETTINGS_COUNTDOWN
+        SETTINGS_COUNTDOWN,
+        SCRIPT_SCROLL
     }
 
     init {
@@ -325,9 +434,24 @@ private class PromptOverlayView(
         invalidate()
     }
 
+    fun setCollapsed(value: Boolean) {
+        isCollapsed = value
+        if (value) {
+            showSettings = false
+            dragMode = DragMode.NONE
+        }
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (isCountingDown) updateCountdown()
+
+        if (isCollapsed) {
+            drawCollapsedBubble(canvas)
+            advancePlayback()
+            return
+        }
 
         canvas.save()
         applyContentTransform(canvas)
@@ -347,6 +471,10 @@ private class PromptOverlayView(
         }
         canvas.restore()
 
+        advancePlayback()
+    }
+
+    private fun advancePlayback() {
         if (isPlaying) {
             val now = System.nanoTime()
             if (lastFrameTime != 0L) {
@@ -361,6 +489,20 @@ private class PromptOverlayView(
         } else {
             lastFrameTime = 0L
         }
+    }
+
+    private fun drawCollapsedBubble(canvas: Canvas) {
+        val centerX = width / 2f
+        val centerY = height / 2f
+        backgroundPaint.color = withAlpha(0xFF1A2A31.toInt(), .96f)
+        canvas.drawCircle(centerX, centerY, min(width, height) / 2f - dp(3f), backgroundPaint)
+        labelPaint.typeface = Typeface.create("sans", Typeface.BOLD)
+        labelPaint.color = 0xFFC4F76A.toInt()
+        labelPaint.textSize = sp(18f)
+        drawCenteredText(canvas, "H", centerX, centerY + dp(6f), labelPaint)
+        linePaint.color = 0x667EAD40
+        linePaint.strokeWidth = dp(2f)
+        canvas.drawCircle(centerX, centerY, min(width, height) / 2f - dp(5f), linePaint)
     }
 
     private fun applyContentTransform(canvas: Canvas) {
@@ -444,6 +586,8 @@ private class PromptOverlayView(
         textPaint.typeface = Typeface.create("sans", Typeface.NORMAL)
         val lineHeight = textPaint.textSize * config.lineSpacing
         val lines = wrapLines(config.text.replace("\r", "").split("\n"), contentWidth - dp(28f))
+        val maxScroll = maxScriptScrollOffset(lineHeight, lines.size, guideY, bottom)
+        scrollOffset = scrollOffset.coerceIn(0f, maxScroll)
         val startY = guideY - lineHeight * .55f - scrollOffset
         lines.forEachIndexed { index, line ->
             val y = startY + index * lineHeight
@@ -470,7 +614,7 @@ private class PromptOverlayView(
         }
         canvas.restore()
 
-        if (isPlaying && scrollOffset > lineHeight * lines.size + (bottom - top)) {
+        if (isPlaying && maxScroll > 0f && scrollOffset >= maxScroll) {
             if (config.loop) {
                 scrollOffset = 0f
             } else {
@@ -518,12 +662,33 @@ private class PromptOverlayView(
         return result.ifEmpty { listOf("输入一段台词，开始你的表达。") }
     }
 
+    private fun maxScriptScrollOffset(
+        lineHeight: Float,
+        lineCount: Int,
+        guideY: Float,
+        bottom: Float
+    ): Float {
+        val lastBaselineAtStart = guideY - lineHeight * .55f + (lineCount - 1) * lineHeight
+        val lastBaselineLimit = bottom - lineHeight * .5f
+        return (lastBaselineAtStart - lastBaselineLimit).coerceAtLeast(0f)
+    }
+
+    private fun currentMaxScriptScrollOffset(): Float {
+        textPaint.textSize = sp(config.fontSize)
+        val lineHeight = textPaint.textSize * config.lineSpacing
+        val top = dp(82f)
+        val bottom = contentHeight - dp(69f)
+        val guideY = top + (bottom - top) * .52f
+        val lines = wrapLines(config.text.replace("\r", "").split("\n"), contentWidth - dp(28f))
+        return maxScriptScrollOffset(lineHeight, lines.size, guideY, bottom)
+    }
+
     private fun drawBottomBar(canvas: Canvas) {
         linePaint.color = 0x334E5C5E
         canvas.drawLine(dp(14f), contentHeight - dp(57f), contentWidth - dp(14f), contentHeight - dp(57f), linePaint)
 
         val left = dp(14f)
-        val right = contentWidth - dp(64f)
+        val right = contentWidth - dp(14f)
         val icons = listOf(
             "↶",
             "☷",
@@ -539,10 +704,6 @@ private class PromptOverlayView(
         icons.forEachIndexed { index, icon ->
             drawCenteredText(canvas, icon, centers[index], contentHeight - dp(24f), labelPaint)
         }
-
-        labelPaint.color = 0xFFC4F76A.toInt()
-        labelPaint.textSize = sp(24f)
-        drawCenteredText(canvas, "⌟", contentWidth - dp(34f), contentHeight - dp(22f), labelPaint)
     }
 
     private fun drawSettingsPanel(canvas: Canvas) {
@@ -645,9 +806,13 @@ private class PromptOverlayView(
         invalidate()
     }
 
+    private fun saveConfigAfterInteraction() {
+        onConfigChanged(config)
+    }
+
     private fun handleBottomAction(x: Float) {
         val left = dp(14f)
-        val right = contentWidth - dp(64f)
+        val right = contentWidth - dp(14f)
         if (x !in left..right) return
         val index = (((x - left) / ((right - left) / 5f)).toInt()).coerceIn(0, 4)
         when (index) {
@@ -659,7 +824,10 @@ private class PromptOverlayView(
             }
             2 -> togglePlayback()
             3 -> onRotate()
-            4 -> config = config.copy(loop = !config.loop)
+            4 -> {
+                config = config.copy(loop = !config.loop)
+                saveConfigAfterInteraction()
+            }
         }
         invalidate()
     }
@@ -687,10 +855,25 @@ private class PromptOverlayView(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isCollapsed) {
+            return when (event.actionMasked) {
+                MotionEvent.ACTION_UP -> {
+                    onExpand()
+                    true
+                }
+                MotionEvent.ACTION_DOWN,
+                MotionEvent.ACTION_MOVE,
+                MotionEvent.ACTION_CANCEL -> true
+                else -> true
+            }
+        }
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downRawX = event.rawX
                 downRawY = event.rawY
+                downWidth = width
+                downHeight = height
                 val point = contentPoint(event.x, event.y)
                 downX = point.x
                 downY = point.y
@@ -712,17 +895,40 @@ private class PromptOverlayView(
                     when (dragMode) {
                         DragMode.SETTINGS_SPEED -> updateSpeedFromX(point.x)
                         DragMode.SETTINGS_FONT -> updateFontFromX(point.x)
-                        DragMode.SETTINGS_COUNTDOWN -> config = config.copy(countdown = !config.countdown)
+                        DragMode.SETTINGS_COUNTDOWN -> {
+                            config = config.copy(countdown = !config.countdown)
+                            saveConfigAfterInteraction()
+                        }
                         else -> Unit
                     }
                     return true
                 }
 
+                val resizeEdge = dp(14f)
+                val moveHandleHalfWidth = dp(44f)
+                val isMoveHandle = point.y < dp(36f) &&
+                    point.x in (contentWidth / 2f - moveHandleHalfWidth)..(contentWidth / 2f + moveHandleHalfWidth)
                 dragMode = when {
                     point.y < dp(64f) && point.x > contentWidth - dp(70f) -> DragMode.CLOSE
+                    isMoveHandle -> DragMode.MOVE
+                    event.x <= resizeEdge -> DragMode.RESIZE_LEFT
+                    event.x >= width - resizeEdge -> DragMode.RESIZE_RIGHT
+                    event.y <= resizeEdge -> DragMode.RESIZE_TOP
+                    event.y >= height - resizeEdge -> DragMode.RESIZE_BOTTOM
                     point.y < dp(36f) -> DragMode.MOVE
-                    point.x > contentWidth - dp(64f) && point.y > contentHeight - dp(70f) -> DragMode.RESIZE
+                    point.y in dp(78f)..(contentHeight - dp(70f)) -> {
+                        scrollAtTouchStart = scrollOffset
+                        didDragScript = false
+                        DragMode.SCRIPT_SCROLL
+                    }
                     else -> DragMode.NONE
+                }
+                if (dragMode == DragMode.RESIZE_LEFT ||
+                    dragMode == DragMode.RESIZE_RIGHT ||
+                    dragMode == DragMode.RESIZE_TOP ||
+                    dragMode == DragMode.RESIZE_BOTTOM
+                ) {
+                    onResizeStart()
                 }
                 return true
             }
@@ -740,17 +946,55 @@ private class PromptOverlayView(
                 val dx = (event.rawX - downRawX).toInt()
                 val dy = (event.rawY - downRawY).toInt()
                 when (dragMode) {
+                    DragMode.SCRIPT_SCROLL -> {
+                        val point = contentPoint(event.x, event.y)
+                        val dragDistance = point.y - downY
+                        if (!didDragScript && abs(dragDistance) > touchSlop) {
+                            didDragScript = true
+                        }
+                        if (didDragScript) {
+                            scrollOffset = (scrollAtTouchStart - dragDistance)
+                                .coerceIn(0f, currentMaxScriptScrollOffset())
+                            invalidate()
+                        }
+                    }
                     DragMode.MOVE -> {
                         downRawX = event.rawX
                         downRawY = event.rawY
                         onMove(dx, dy)
                     }
-                    DragMode.RESIZE -> {
-                        val newWidth = (width + dx).coerceIn(dp(250f).toInt(), dp(720f).toInt())
-                        val newHeight = (height + dy).coerceIn(dp(180f).toInt(), dp(560f).toInt())
-                        downRawX = event.rawX
-                        downRawY = event.rawY
-                        onResize(newWidth, newHeight)
+                    DragMode.RESIZE_LEFT,
+                    DragMode.RESIZE_RIGHT,
+                    DragMode.RESIZE_TOP,
+                    DragMode.RESIZE_BOTTOM -> {
+                        val totalDx = (event.rawX - downRawX).toInt()
+                        val totalDy = (event.rawY - downRawY).toInt()
+                        val minWidth = dp(250f).toInt()
+                        val maxWidth = dp(720f).toInt()
+                        val minHeight = dp(180f).toInt()
+                        val maxHeight = dp(560f).toInt()
+                        var newWidth = downWidth
+                        var newHeight = downHeight
+                        var moveX = 0
+                        var moveY = 0
+                        when (dragMode) {
+                            DragMode.RESIZE_LEFT -> {
+                                newWidth = (downWidth - totalDx).coerceIn(minWidth, maxWidth)
+                                moveX = downWidth - newWidth
+                            }
+                            DragMode.RESIZE_RIGHT -> {
+                                newWidth = (downWidth + totalDx).coerceIn(minWidth, maxWidth)
+                            }
+                            DragMode.RESIZE_TOP -> {
+                                newHeight = (downHeight - totalDy).coerceIn(minHeight, maxHeight)
+                                moveY = downHeight - newHeight
+                            }
+                            DragMode.RESIZE_BOTTOM -> {
+                                newHeight = (downHeight + totalDy).coerceIn(minHeight, maxHeight)
+                            }
+                            else -> Unit
+                        }
+                        onResize(newWidth, newHeight, moveX, moveY)
                     }
                     DragMode.CLOSE,
                     DragMode.SETTINGS_CLOSE,
@@ -766,20 +1010,22 @@ private class PromptOverlayView(
                     if (event.actionMasked == MotionEvent.ACTION_UP && dragMode == DragMode.SETTINGS_CLOSE) {
                         showSettings = false
                     }
+                    if (dragMode == DragMode.SETTINGS_SPEED || dragMode == DragMode.SETTINGS_FONT) {
+                        saveConfigAfterInteraction()
+                    }
                     dragMode = DragMode.NONE
                     invalidate()
                     return true
                 }
 
                 if (event.actionMasked == MotionEvent.ACTION_UP && dragMode == DragMode.CLOSE) {
-                    onClose()
+                    onCollapse()
+                } else if (dragMode == DragMode.SCRIPT_SCROLL && event.actionMasked == MotionEvent.ACTION_UP && !didDragScript) {
+                    togglePlayback()
+                    invalidate()
                 } else if (dragMode == DragMode.NONE && event.actionMasked == MotionEvent.ACTION_UP) {
                     when {
                         downY > contentHeight - dp(64f) -> handleBottomAction(downX)
-                        downY in dp(78f)..(contentHeight - dp(70f)) -> {
-                            togglePlayback()
-                            invalidate()
-                        }
                     }
                 }
                 dragMode = DragMode.NONE

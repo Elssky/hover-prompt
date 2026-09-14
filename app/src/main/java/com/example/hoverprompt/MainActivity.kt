@@ -120,6 +120,8 @@ data class PromptSettings(
 )
 
 class MainActivity : ComponentActivity() {
+    private var settingsRefreshToken by mutableStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -127,10 +129,16 @@ class MainActivity : ComponentActivity() {
                 PromptHome(
                     onLaunchOverlay = { script, settings -> launchOverlay(script, settings) },
                     onSettingsChange = { script, settings -> syncOverlay(script, settings) },
-                    onRequestPermission = { requestOverlayPermission() }
+                    onRequestPermission = { requestOverlayPermission() },
+                    settingsRefreshToken = settingsRefreshToken
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        settingsRefreshToken++
     }
 
     private fun requestOverlayPermission() {
@@ -150,7 +158,7 @@ class MainActivity : ComponentActivity() {
         }
 
         requestNotificationPermissionIfNeeded()
-        startForegroundService(createOverlayIntent(script, settings))
+        startForegroundService(createOverlayIntent(script, PromptSettingsStore.load(this)))
         Toast.makeText(this, "悬浮提词已打开，可切换到相机或抖音", Toast.LENGTH_SHORT).show()
     }
 
@@ -212,13 +220,22 @@ private fun HoverPromptTheme(content: @Composable () -> Unit) {
 private fun PromptHome(
     onLaunchOverlay: (String, PromptSettings) -> Unit,
     onSettingsChange: (String, PromptSettings) -> Unit,
-    onRequestPermission: () -> Unit
+    onRequestPermission: () -> Unit,
+    settingsRefreshToken: Int
 ) {
+    val context = LocalContext.current
     var script by remember { mutableStateOf(TextFieldValue(SAMPLE_SCRIPT)) }
-    var settings by remember { mutableStateOf(PromptSettings()) }
+    var settings by remember { mutableStateOf(PromptSettingsStore.load(context)) }
+    var history by remember { mutableStateOf(PromptHistoryStore.load(context)) }
     var showSettings by remember { mutableStateOf(true) }
     var previewPlaying by remember { mutableStateOf(false) }
     val scrollState = rememberScrollState()
+
+    LaunchedEffect(settingsRefreshToken) {
+        if (settingsRefreshToken > 0) {
+            settings = PromptSettingsStore.load(context)
+        }
+    }
 
     Surface(modifier = Modifier.fillMaxSize(), color = Ink) {
         Column(
@@ -242,7 +259,10 @@ private fun PromptHome(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Button(
-                    onClick = { onLaunchOverlay(script.text, settings) },
+                    onClick = {
+                        history = PromptHistoryStore.record(context, script.text)
+                        onLaunchOverlay(script.text, settings)
+                    },
                     modifier = Modifier.weight(1f).height(54.dp),
                     shape = RoundedCornerShape(18.dp),
                     colors = ButtonDefaults.buttonColors(
@@ -279,17 +299,85 @@ private fun PromptHome(
                     onSettingsChange("", settings)
                 }
             )
+            if (history.isNotEmpty()) {
+                ScriptHistoryPanel(
+                    entries = history,
+                    onSelect = {
+                        script = TextFieldValue(it)
+                        onSettingsChange(it, settings)
+                    },
+                    onDelete = { history = PromptHistoryStore.delete(context, it) },
+                    onClear = {
+                        PromptHistoryStore.clear(context)
+                        history = emptyList()
+                    }
+                )
+            }
             AnimatedVisibility(visible = showSettings) {
                 PromptSettingsPanel(
                     settings = settings,
                     onSettingsChange = {
                         settings = it
+                        PromptSettingsStore.save(context, it)
                         onSettingsChange(script.text, it)
                     }
                 )
             }
             TipCard()
             Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+@Composable
+private fun ScriptHistoryPanel(
+    entries: List<String>,
+    onSelect: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onClear: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Panel)
+    ) {
+        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Text("最近使用的台词", color = Paper, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Text("点击记录可以重新载入", color = Muted, fontSize = 11.sp)
+                }
+                TextButton(onClick = onClear) {
+                    Text("清空", color = Muted, fontSize = 12.sp)
+                }
+            }
+            entries.forEachIndexed { index, entry ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(PanelRaised)
+                        .clickable { onSelect(entry) }
+                        .padding(start = 14.dp, top = 10.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "${index + 1}. ${entry.replace("\n", " ")}",
+                        modifier = Modifier.weight(1f),
+                        color = Paper,
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                    )
+                    IconButton(onClick = { onDelete(entry) }) {
+                        Icon(Icons.Filled.DeleteOutline, contentDescription = "删除历史台词", tint = Muted)
+                    }
+                }
+            }
         }
     }
 }
